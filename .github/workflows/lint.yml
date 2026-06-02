@@ -119,7 +119,7 @@ jobs:
       run: |
         echo "::group::make pilot"
         if [ "${{ runner.os }}" = "macOS" ]; then
-          job_make_parallel='MAKE_PARALLEL=-j2'
+          job_make_parallel='MAKE_PARALLEL=-j4'
         else
           job_make_parallel=''
         fi
