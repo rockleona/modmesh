@@ -118,8 +118,14 @@ jobs:
     - name: make pilot
       run: |
         echo "::group::make pilot"
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          job_make_parallel='MAKE_PARALLEL=-j2'
+        else
+          job_make_parallel=''
+        fi
         make pilot \
           ${JOB_MAKE_ARGS} \
+          ${job_make_parallel} \
           CMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }} \
           CMAKE_ARGS="-DPYTHON_EXECUTABLE=$(which python3)"
         echo "::endgroup::"
