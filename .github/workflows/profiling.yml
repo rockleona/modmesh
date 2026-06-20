@@ -1,18 +1,17 @@
 name: profiling
 
 on:
+  push:
+  pull_request:
   schedule:
     - cron: '34 17 * * *'
   workflow_dispatch:
-  push:
-  pull_request:
 
 jobs:
   profile:
 
-    # Run profiling on schedule or when MMGH_FORCE_PROFILE is set to 'enable'.
-    # MMGH_FORCE_PROFILE can force profiling for push and pull_request events.
-    # See: https://docs.github.com/en/actions/learn-github-actions/variables#organization-and-repository-variables
+    # Run profiling only on schedule or when MMGH_FORCE_PROFILE is set to 'enable'
+    # You can refer to https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables to set MMGH_FORCE_PROFILE in the fork repository settings for testing purposes.
     if: ${{ vars.MMGH_NIGHTLY == 'enable' || vars.MMGH_FORCE_PROFILE == 'enable' }}
 
     name: profile_${{ matrix.os }}
