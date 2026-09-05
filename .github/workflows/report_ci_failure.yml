@@ -7,6 +7,17 @@ on:
         description: 'String of job results'
         required: true
         type: string
+  # TEMPORARY, test-only: lets this workflow be dispatched directly against
+  # any ref, bypassing devbuild/lint/devbuild_windows's fork/master gate, so
+  # the PR-resolution/dedup/issue-creation logic can be exercised on a fork.
+  # Drop this trigger before opening the real pull request.
+  workflow_dispatch:
+    inputs:
+      job_results:
+        description: 'String of job results'
+        required: false
+        type: string
+        default: 'manual workflow_dispatch test run, no real job results'
 
 jobs:
   report_ci_failure:
