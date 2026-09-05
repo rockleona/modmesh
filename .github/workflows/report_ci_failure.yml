@@ -1,0 +1,71 @@
+name: report_ci_failure
+
+on:
+  workflow_call:
+    inputs:
+      job_results:
+        description: 'String of job results'
+        required: true
+        type: string
+
+jobs:
+  report_ci_failure:
+    name: open_issue_for_pr_that_broke_master
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Find and notify the pull request that broke master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_RESULTS: ${{ inputs.job_results }}
+        run: |
+          echo "::group::Resolve the pull request for ${{ github.sha }}"
+          pr_number=$(gh api "repos/$GITHUB_REPOSITORY/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')
+          pr_author=$(gh api "repos/$GITHUB_REPOSITORY/commits/${{ github.sha }}/pulls" --jq '.[0].user.login // empty')
+          echo "pr_number=${pr_number:-<none>} pr_author=${pr_author:-<none>}"
+          echo "::endgroup::"
+
+          if [ -z "$pr_number" ]; then
+            echo 'No pull request is associated with this commit; nothing to report.'
+            exit 0
+          fi
+
+          title="CI failure in ${{ github.workflow }} after merging #${pr_number}"
+          open_reports=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 100 \
+            --json title \
+            --jq "map(select(.title == \"$title\")) | length")
+
+          if [ "$open_reports" -gt 0 ]; then
+            echo 'An open failure report for this pull request already exists.'
+            exit 0
+          fi
+
+          body=$(cat <<EOF
+          Pull request #${pr_number} by @${pr_author} merged into master, and the
+          ${{ github.workflow }} workflow failed on the resulting push.
+
+          Job Status Report:
+          ------------------
+          ${JOB_RESULTS}
+
+          Check the details at ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Related pull request: ${{ github.server_url }}/${GITHUB_REPOSITORY}/pull/${pr_number}
+          EOF
+          )
+
+          issue_url=$(gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --body "$body")
+          echo "Opened $issue_url"
+
+          # An external contributor may not be assignable on this repo, so a
+          # failed assignment does not fail the job; the body mention above
+          # already names and notifies the author either way.
+          gh issue edit "$issue_url" --add-assignee "$pr_author" || \
+            echo "Could not assign @${pr_author}; left the issue unassigned."
