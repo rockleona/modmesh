@@ -227,15 +227,15 @@ jobs:
 
   report_ci_failure:
     needs: [check_skip, lint]
-    # Report a master push failure only, on the same gate as
-    # send_email_on_failure above.
+    # TEMPORARY, test-only: the fork check is dropped here so this fires
+    # for real on a fork push. Restore it before opening the real pull
+    # request; see send_email_on_failure above for the original gate.
     if: |
       always() &&
       (contains(needs.*.result, 'failure') ||
        contains(needs.*.result, 'cancelled')) &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/master' &&
-      github.event.repository.fork == false
+      github.ref == 'refs/heads/master'
     permissions:
       issues: write
       pull-requests: read
