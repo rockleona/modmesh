@@ -73,6 +73,10 @@ jobs:
       # Fix issue: https://github.com/solvcon/solvcon/issues/366
       # Use custom config for jurplel/install-qt-action@v4
       AQT_CONFIG: "thirdparty/aqt_settings.ini"
+      # Persistent home for the ctcache database (see the "ctcache" step
+      # below). Both the push (make pilot) and pull_request
+      # (make pilot_clang_tidy_diff) paths run clang-tidy through it.
+      CTCACHE_DIR: ${{ runner.temp }}/ctcache
 
     strategy:
       matrix:
@@ -124,6 +128,20 @@ jobs:
         # Bound the cache so it does not grow without limit across the rolling
         # key.
         max-size: 1500M
+
+    # Unlike ccache above, this runs for every event: a pull request drives
+    # clang-tidy through pilot_clang_tidy_diff and benefits from a hit just
+    # as much as a push building through make pilot. actions/cache refuses to
+    # overwrite an existing key, so the key carries the commit SHA and
+    # restore-keys falls back to the closest previous entry; this creates one
+    # cache generation per commit rather than updating a single rolling entry.
+    - name: ctcache
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.CTCACHE_DIR }}
+        key: ${{ runner.os }}-ctcache-${{ matrix.cmake_build_type }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ctcache-${{ matrix.cmake_build_type }}-
 
     - name: make cformat (clang-format check)
       run: |

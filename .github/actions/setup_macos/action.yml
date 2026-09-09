@@ -103,6 +103,18 @@ runs:
         clang-format --version
         echo "::endgroup::"
 
+    - name: Install ctcache for lint
+      if: ${{ inputs.workflow == 'lint' }}
+      shell: bash
+      run: |
+        echo "::group::Install ctcache for lint"
+        # Pin to a commit rather than @main so an upstream change cannot
+        # break this CI unannounced. See
+        # https://github.com/matus-chochlik/ctcache
+        python3 -m pip install --break-system-packages \
+            "git+https://github.com/matus-chochlik/ctcache.git@0c7fee26e09ae8a393ed7d56164102da118ab23a"
+        echo "::endgroup::"
+
     - name: install pybind11 (pip wheel)
       shell: bash
       run: |
