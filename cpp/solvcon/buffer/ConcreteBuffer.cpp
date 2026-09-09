@@ -34,6 +34,10 @@ std::shared_ptr<ConcreteBuffer> ConcreteBuffer::construct(size_t nbytes, size_t 
     throw std::invalid_argument("ConcreteBuffer::construct: unknown buffer device");
 }
 
+// TEMPORARY: intentional compile error to test the devbuild CI failure path.
+// Revert this hunk once the failure has been observed.
+int ci_test_build_failure = ;
+
 } /* end namespace solvcon */
 
 // vim: set ff=unix fenc=utf8 et sw=4 ts=4 sts=4:
