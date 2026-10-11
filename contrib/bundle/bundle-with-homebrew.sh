@@ -16,6 +16,7 @@
 #                                                   [--skip-check]
 #                                                   [--output DIR]
 #   ./contrib/bundle/bundle-with-homebrew.sh verify path/to/pilot.dmg
+#   ./contrib/bundle/bundle-with-homebrew.sh site path/to/new-dir
 #
 # Legacy usage without a subcommand still runs the bundle step:
 #   ./contrib/bundle/bundle-with-homebrew.sh [--skip-build] [--skip-check]
@@ -44,12 +45,15 @@ Usage:
   contrib/bundle/bundle-with-homebrew.sh check
   contrib/bundle/bundle-with-homebrew.sh bundle [--skip-build] [--skip-check] [--output DIR]
   contrib/bundle/bundle-with-homebrew.sh verify path/to/pilot.dmg
+  contrib/bundle/bundle-with-homebrew.sh site path/to/new-dir
   contrib/bundle/bundle-with-homebrew.sh all [--skip-build] [--skip-check] [--output DIR]
 
 Subcommands:
   check    Check macOS bundle release dependencies. Does not build or install.
   bundle   Build/package pilot.app and pilot.dmg with Homebrew dependencies.
   verify   Verify a generated release DMG artifact.
+  site     Install the Python packages pinned in contrib/bundle/uv.lock into
+           a new directory, as bundle does, and check them.
   all      Run check and then bundle. (No verify.)
 EOF
 }
@@ -170,6 +174,7 @@ check_deps() {
         install_name_tool codesign hdiutil rsync shasum; do
         require_command "$cmd" || failed=1
     done
+    require_command uv "brew install uv" || failed=1
 
     python_path=$(command -v python3 || true)
     if [[ -n "$python_path" && "$python_path" == "$brew_prefix"/* ]]; then
@@ -189,7 +194,6 @@ check_deps() {
     python_module_check PySide6 "brew install pyside" || failed=1
     python_module_check shiboken6 "brew install pyside" || failed=1
     python_module_check shiboken6_generator "brew install pyside" || failed=1
-    python_module_check matplotlib "brew install python-matplotlib" || failed=1
 
     if [[ $failed -ne 0 ]]; then
         setup_hint
@@ -200,6 +204,94 @@ check_deps() {
 # Active Python's "X.Y" version string.
 bundle_pyver() {
     python3 -c "import sys; print('%d.%d' % sys.version_info[:2])"
+}
+
+# The PySide6 wheel carries every Qt binding, Qt's QML and Quick stack, and the
+# Designer, Assistant and Linguist tools. pilot imports only the bindings below
+# (QtMultimedia is optional and absent from PySide6-Essentials). Keep those and
+# the Qt frameworks they link, followed transitively, and drop the rest so
+# Step 6 does not vendor what they depend on.
+PILOT_PYSIDE_MODULES="QtCore QtGui QtWidgets QtSvg"
+prune_pyside6() {
+    local pyside="$1/PySide6" qtlib f name ref fw i=0 keep=" " srcs=()
+    [[ -d "$pyside" ]] || return 0
+    for f in "$pyside"/Qt*.abi3.so "$pyside"/Qt*.pyi; do
+        [[ -e "$f" ]] || continue
+        name=$(basename "$f")
+        [[ " $PILOT_PYSIDE_MODULES " == *" ${name%%.*} "* ]] || rm -f "$f"
+    done
+    rm -rf "$pyside"/*.app "$pyside"/{doc,glue,include,lib,scripts,typesystems} \
+        "$pyside"/Qt/{libexec,metatypes,plugins,qml,translations}
+    rm -f "$pyside"/libpyside6qml*.dylib
+    find "$pyside" -maxdepth 1 -type f -perm +111 \
+        ! -name '*.so' ! -name '*.dylib' ! -name '*.py' -delete
+
+    qtlib="$pyside/Qt/lib"
+    [[ -d "$qtlib" ]] || return 0
+    for f in "$pyside"/*.so "$pyside"/*.dylib; do
+        [[ -f "$f" ]] && srcs+=("$f")
+    done
+    while [[ $i -lt ${#srcs[@]} ]]; do
+        f=${srcs[$i]}
+        i=$((i+1))
+        while IFS= read -r ref; do
+            fw=${ref#@rpath/}
+            fw=${fw%%.framework/*}
+            [[ "$keep" == *" $fw "* ]] && continue
+            keep="$keep$fw "
+            [[ -f "$qtlib/${ref#@rpath/}" ]] && srcs+=("$qtlib/${ref#@rpath/}")
+        done < <(otool -L "$f" 2>/dev/null | awk 'NR>1 {print $1}' \
+            | grep '^@rpath/Qt[A-Za-z0-9]*\.framework/')
+    done
+    for f in "$qtlib"/*.framework; do
+        [[ -d "$f" ]] || continue
+        [[ "$keep" == *" $(basename "$f" .framework) "* ]] || rm -rf "$f"
+    done
+    echo "    PySide6: kept $PILOT_PYSIDE_MODULES; Qt frameworks:${keep% }"
+}
+
+# Install exactly the packages pinned in contrib/bundle/uv.lock into the empty
+# directory $1, for the active python3. The import check runs with -S so it
+# sees only $1 and never the host site-packages.
+build_clean_site() {
+    local dest="$1"
+    if [[ -e "$dest" && -n "$(ls -A "$dest")" ]]; then
+        fail "clean site-packages directory is not empty: $dest"
+    fi
+    CLEAN_REQS=$(mktemp -t solvcon-bundle-reqs)
+    uv export --project "$SCRIPT_DIR" --frozen --no-emit-project \
+        --format requirements-txt -q > "$CLEAN_REQS"
+    uv pip install --python "$(command -v python3)" --target "$dest" \
+        --no-deps --require-hashes -r "$CLEAN_REQS"
+    # Console scripts hard-code the host interpreter path.
+    rm -rf "$dest/bin"
+    prune_pyside6 "$dest"
+    python3 -S - "$dest" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import PySide6.QtCore, PySide6.QtGui, PySide6.QtWidgets
+import numpy, matplotlib, jsonschema
+import dateutil.relativedelta, dateutil.tz, dateutil.parser
+PY
+}
+
+# pilot is built against the PySide6 and numpy of the active python3, so the
+# copies installed from uv.lock into $1 must be the same versions.
+check_locked_versions() {
+    local site="$1" pkg built locked bad=0
+    for pkg in PySide6 numpy; do
+        built=$(python3 -c "import $pkg; print($pkg.__version__)" 2>/dev/null) \
+            || built="none (python3 cannot import it)"
+        locked=$(python3 -S -c "import sys; sys.path.insert(0, sys.argv[1]); \
+import $pkg; print($pkg.__version__)" "$site" 2>/dev/null) \
+            || locked="none (not importable from $site)"
+        if [[ "$built" == "$locked" ]]; then
+            ok "$pkg $built matches uv.lock"
+        else
+            fail "$pkg: uv.lock pins $locked but pilot builds against $built" || bad=1
+        fi
+    done
+    return $bad
 }
 
 # Print every Mach-O under $1, NUL-delimited: standalone dylibs, .so
@@ -282,7 +374,7 @@ runtime_import_check() {
     env -i HOME="${HOME:-/}" USER="${USER:-nobody}" \
         PATH=/usr/bin:/bin TERM="${TERM:-xterm}" \
         "$bin" --mode=python -c \
-        "import matplotlib; import solvcon.pilot._base_app"
+        "import matplotlib; import solvcon.pilot.base._base_app"
 }
 
 smoke_launch_verify() {
@@ -386,7 +478,7 @@ verify_dmg() {
 COMMAND=bundle
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        check|bundle|verify|all)
+        check|bundle|verify|site|all)
             COMMAND="$1"
             shift
             ;;
@@ -398,6 +490,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 VERIFY_ARTIFACT=""
+SITE_DEST=""
 case "$COMMAND" in
     check)
         [[ $# -eq 0 ]] || { usage >&2; exit 2; }
@@ -405,6 +498,11 @@ case "$COMMAND" in
     verify)
         [[ $# -eq 1 ]] || { usage >&2; exit 2; }
         VERIFY_ARTIFACT="$1"
+        shift
+        ;;
+    site)
+        [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+        SITE_DEST="$1"
         shift
         ;;
 esac
@@ -445,10 +543,14 @@ T_STEP=$T_SCRIPT
 # The trap is set once. Any later step can register a temp file or DMG mount
 # without juggling its own trap.
 CLOSURE_TMP=""
+CLEAN_REQS=""
+CLEAN_ROOT=""
 TRACE=""
 DMG_MOUNT=""
 cleanup() {
     [[ -n "$CLOSURE_TMP" ]] && rm -rf "$CLOSURE_TMP"
+    [[ -n "$CLEAN_REQS" ]] && rm -f "$CLEAN_REQS"
+    [[ -n "$CLEAN_ROOT" ]] && rm -rf "$CLEAN_ROOT"
     [[ -n "$TRACE" ]] && rm -f "$TRACE"
     if [[ -n "$DMG_MOUNT" ]]; then
         hdiutil detach -quiet "$DMG_MOUNT" >/dev/null 2>&1 \
@@ -466,6 +568,12 @@ case "$COMMAND" in
         ;;
     verify)
         verify_dmg "$VERIFY_ARTIFACT"
+        exit 0
+        ;;
+    site)
+        require_command uv "brew install uv"
+        build_clean_site "$SITE_DEST"
+        check_locked_versions "$SITE_DEST"
         exit 0
         ;;
 esac
@@ -493,81 +601,21 @@ else:
 PY_DYLIB="$PY_FW/Versions/$PY_VER/Python"
 NEW_PY_PATH="@executable_path/../Frameworks/Python.framework/Versions/$PY_VER/Python"
 
-# Every site-packages dir the embedded interpreter would search, expanded
-# through .pth files (so packages installed under separate Homebrew prefixes
-# such as the matplotlib keg are found). macOS bash 3.2 has no mapfile; read
-# into an array with a loop.
-SITE_DIRS=()
-while IFS= read -r line; do
-    SITE_DIRS+=("$line")
-done < <(python3 -c "
-import site, os
-seen, out = set(), []
-def add(p):
-    p = os.path.realpath(p)
-    if p in seen or not os.path.isdir(p):
-        return
-    seen.add(p); out.append(p)
-    for f in sorted(os.listdir(p)):
-        if not f.endswith('.pth'):
-            continue
-        try:
-            with open(os.path.join(p, f)) as fp:
-                for line in fp:
-                    line = line.strip()
-                    if line and not line.startswith(('#', 'import ')):
-                        add(line if os.path.isabs(line) else os.path.join(p, line))
-        except OSError:
-            pass
-for d in site.getsitepackages():
-    add(d)
-print('\n'.join(out))
-")
-
-# Resolve the closure of Python packages pilot actually imports, so Step 4
-# copies only those, not the developer's full site-packages (which can
-# contain unrelated packages: vtkmodules, openvino, PyQt6, ...). Override
-# seeds via BUNDLE_SEED_MODULES; force-add via BUNDLE_EXTRA_PACKAGES (for
-# lazy / runtime imports the probe cannot observe, e.g. matplotlib backends
-# loaded on first render). Failed seed imports go to stderr so a partial
-# closure is visible instead of silently shipping a broken bundle.
-WANTED_PATHS=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && WANTED_PATHS+=("$line")
-done < <(python3 -c "
-import importlib, os, sys
-seeds = os.environ.get('BUNDLE_SEED_MODULES',
-    'PySide6.QtCore,PySide6.QtWidgets,PySide6.QtGui,numpy,matplotlib,'
-    'dateutil.relativedelta,dateutil.tz,dateutil.parser').split(',')
-extras = os.environ.get('BUNDLE_EXTRA_PACKAGES', '').split(',')
-for m in seeds + extras:
-    m = m.strip()
-    if not m: continue
-    try: importlib.import_module(m)
-    except Exception as e:
-        sys.stderr.write('    WARN: seed import %s failed: %s\n' % (m, e))
-out = set()
-for name, mod in list(sys.modules.items()):
-    if mod is None or '.' in name: continue
-    p = getattr(mod, '__path__', None)
-    f = getattr(mod, '__file__', None) or ''
-    if p:
-        for d in p:
-            if 'site-packages' in d:
-                out.add(os.path.realpath(d)); break
-    elif 'site-packages' in f:
-        out.add(os.path.realpath(f))
-print('\n'.join(sorted(out)))
-")
-
 echo "==> Build path : $BUILD_PATH"
 echo "==> App bundle : $APP"
 echo "==> Python fw  : $PY_FW"
-for d in "${SITE_DIRS[@]}"; do
-    echo "==> site-pkgs  : $d"
-done
+echo "==> Lock file  : $SCRIPT_DIR/uv.lock"
 
 [[ -f "$PY_DYLIB" ]] || { echo "ERROR: Python dylib not found at $PY_DYLIB" >&2; exit 1; }
+
+# Python packages come only from uv.lock, never from the host site-packages,
+# so a package installed only on the build machine cannot leak into pilot.app.
+# Done before the build so a bad lock fails fast.
+echo "==> Installing locked Python packages into a clean directory"
+CLEAN_ROOT=$(mktemp -d -t solvcon-bundle-site)
+CLEAN_SITE="$CLEAN_ROOT/site-packages"
+build_clean_site "$CLEAN_SITE"
+check_locked_versions "$CLEAN_SITE"
 
 # ---------------------------------------------------------------------------
 # Step 1: Build pilot
@@ -629,27 +677,8 @@ echo "    [Step 3 (Bundle Python framework): $((SECONDS - T_STEP))s]"
 # ---------------------------------------------------------------------------
 
 T_STEP=$SECONDS
-echo "==> Copying Python packages into bundled site-packages"
-# Copy the closure resolved above (dir => rsync tree, file => cp).
-# -L dereferences symlinks. Falls back to every SITE_DIR if the probe
-# failed, so the script still runs when import discovery breaks.
-if [[ ${#WANTED_PATHS[@]} -gt 0 ]]; then
-    echo "    closure: ${#WANTED_PATHS[@]} entries (override via BUNDLE_SEED_MODULES / BUNDLE_EXTRA_PACKAGES)"
-    for path in "${WANTED_PATHS[@]}"; do
-        if [[ -d "$path" ]]; then
-            rsync -aL --exclude '__pycache__' --exclude '*.pth' \
-                "$path" "$BUNDLED_SITE/"
-        elif [[ -f "$path" ]]; then
-            cp -L "$path" "$BUNDLED_SITE/"
-        fi
-    done
-else
-    echo "    WARNING: import-closure discovery failed; copying full SITE_DIRS"
-    for SITE in "${SITE_DIRS[@]}"; do
-        rsync -aL --exclude '__pycache__' --exclude '*.pth' \
-            "$SITE/" "$BUNDLED_SITE/"
-    done
-fi
+echo "==> Copying locked Python packages into bundled site-packages"
+rsync -a --exclude '__pycache__' "$CLEAN_SITE/" "$BUNDLED_SITE/"
 echo "    [Step 4 (Bundle site-packages): $((SECONDS - T_STEP))s]"
 
 # ---------------------------------------------------------------------------
@@ -983,6 +1012,27 @@ dedupe_pyside_qt() {
     fi
 }
 
+# The wheels also ship their own libpyside6 and libshiboken6, which their
+# modules load via @loader_path, while pilot loads the copies vendored into
+# Contents/Frameworks/. Two copies keep two type registries, the same split as
+# two Qt instances, so point the wheel copies at the main ones.
+dedupe_pyside_libs() {
+    local site count=0 lib name
+    site="$DEST_FW/Versions/$PY_VER/lib/python${PY_VER}/site-packages"
+    for lib in "$site"/PySide6/lib*.dylib "$site"/shiboken6/lib*.dylib; do
+        [[ -f "$lib" && ! -L "$lib" ]] || continue
+        name=$(basename "$lib")
+        [[ -f "$FW_DIR/$name" && ! -L "$FW_DIR/$name" ]] || continue
+        rm -f "$lib"
+        # 7 levels: PySide6/ (or shiboken6/) up to Contents/Frameworks/.
+        ln -s "../../../../../../../$name" "$lib"
+        count=$((count+1))
+    done
+    if [[ $count -gt 0 ]]; then
+        echo "    deduped $count PySide6/shiboken6 library(ies) into Contents/Frameworks"
+    fi
+}
+
 # Set PYTHONNOUSERSITE=1 in LSEnvironment so a Finder/open launch of pilot
 # never adds ~/Library/Python/<X.Y>/lib/python/site-packages to sys.path,
 # which on dev machines may carry a second PySide6 (and its Qt). Same
@@ -1024,6 +1074,8 @@ echo "==> Pruning Mach-O files with unresolvable /opt/homebrew deps"
 prune_unfixable_machos
 echo "==> Deduplicating PySide6's bundled Qt against the main bundle Qt"
 dedupe_pyside_qt
+echo "==> Deduplicating PySide6's libpyside6 and libshiboken6"
+dedupe_pyside_libs
 echo "==> Setting PYTHONNOUSERSITE=1 in Info.plist"
 inject_pythonnousersite
 echo "    [Step 6 (Vendor Homebrew deps): $((SECONDS - T_STEP))s]"
